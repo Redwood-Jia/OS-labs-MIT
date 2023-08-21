@@ -22,16 +22,18 @@
 #include "defs.h"
 #include "fs.h"
 #include "buf.h"
+#define  NBUC   13
 
 struct {
   struct spinlock lock;
   struct buf buf[NBUF];
-
-  // Linked list of all buffers, through prev/next.
-  // Sorted by how recently the buffer was used.
-  // head.next is most recent, head.prev is least.
-  struct buf head;
 } bcache;
+
+struct bMem{
+	struct spinlock lock;
+	struct buf head;
+};
+static struct bMem hashTable[NBUC];
 
 void
 binit(void)
@@ -40,16 +42,24 @@ binit(void)
 
   initlock(&bcache.lock, "bcache");
 
-  // Create linked list of buffers
-  bcache.head.prev = &bcache.head;
-  bcache.head.next = &bcache.head;
-  for(b = bcache.buf; b < bcache.buf+NBUF; b++){
-    b->next = bcache.head.next;
-    b->prev = &bcache.head;
-    initsleeplock(&b->lock, "buffer");
-    bcache.head.next->prev = b;
-    bcache.head.next = b;
+  for(int i = 0; i < NBUC; i++) {
+    initlock(&(hashTable[i].lock),"bache.bucket");
   }
+  // Create linked list of buffers
+ 
+  for(b = bcache.buf; b < bcache.buf+NBUF; b++){
+    initsleeplock(&b->lock, "buffer");
+  }
+}
+
+//newly added
+void
+replaceBuffer(struct buf *lruBuf, uint dev, uint blockno, uint ticks){
+  lruBuf->dev = dev;
+  lruBuf->blockno = blockno;
+  lruBuf->valid = 0;
+  lruBuf->refcnt = 1;
+  lruBuf->tick = ticks;
 }
 
 // Look through buffer cache for block on device dev.
@@ -58,34 +68,67 @@ binit(void)
 static struct buf*
 bget(uint dev, uint blockno)
 {
-  struct buf *b;
+    struct buf *b;
+	struct buf *lastBuf;
 
-  acquire(&bcache.lock);
+	// Is the block already cached?
+	uint64 num = blockno%NBUC;
+	acquire(&(hashTable[num].lock));
+	for(b = hashTable[num].head.next, lastBuf = &(hashTable[num].head); b; b = b->next){
+		if (!(b->next)){
+			lastBuf = b;
+		}
+		if(b->dev == dev && b->blockno == blockno){
+			b->refcnt++;
+			release(&(hashTable[num].lock));
+			acquiresleep(&b->lock);
+			return b;
+		}
+	}
 
-  // Is the block already cached?
-  for(b = bcache.head.next; b != &bcache.head; b = b->next){
-    if(b->dev == dev && b->blockno == blockno){
-      b->refcnt++;
-      release(&bcache.lock);
-      acquiresleep(&b->lock);
-      return b;
-    }
-  }
+	struct buf *lruBuf = 0;
+	acquire(&bcache.lock);
+	for(b = bcache.buf; b < bcache.buf + NBUF; b++){
+	    if(b->refcnt == 0) {
+	    	if (lruBuf == 0){
+	    		lruBuf = b;
+	    		continue;
+	    	}
+			if (b->tick < lruBuf->tick){
+				lruBuf = b;
+			}
+	    }
+  	}
 
-  // Not cached.
-  // Recycle the least recently used (LRU) unused buffer.
-  for(b = bcache.head.prev; b != &bcache.head; b = b->prev){
-    if(b->refcnt == 0) {
-      b->dev = dev;
-      b->blockno = blockno;
-      b->valid = 0;
-      b->refcnt = 1;
-      release(&bcache.lock);
-      acquiresleep(&b->lock);
-      return b;
-    }
-  }
-  panic("bget: no buffers");
+	if (lruBuf){
+	  	uint64 oldTick = lruBuf->tick;
+		uint64 oldNum = (lruBuf->blockno)%NBUC;
+		if(oldTick == 0){
+			replaceBuffer(lruBuf, dev, blockno, ticks);
+			lastBuf->next = lruBuf;
+			lruBuf->prev = lastBuf;
+		}else {
+			if (oldNum != num){
+				acquire(&(hashTable[oldNum].lock));
+				replaceBuffer(lruBuf, dev, blockno, ticks);
+				lruBuf->prev->next = lruBuf->next;
+				if (lruBuf->next){
+					lruBuf->next->prev = lruBuf->prev;
+				}
+				release(&(hashTable[oldNum].lock));
+				lastBuf->next = lruBuf;
+				lruBuf->prev = lastBuf;
+				lruBuf->next = 0;
+			}else {
+				replaceBuffer(lruBuf, dev, blockno, ticks);
+			}
+		}
+	  	release(&bcache.lock);
+		release(&(hashTable[num].lock));
+		acquiresleep(&lruBuf->lock);
+		return lruBuf;
+	}
+  	panic("bget: no buffers");
 }
 
 // Return a locked buf with the contents of the indicated block.
@@ -121,33 +164,26 @@ brelse(struct buf *b)
 
   releasesleep(&b->lock);
 
-  acquire(&bcache.lock);
+  uint64 num = b->blockno % NBUC;
+  acquire(&(hashTable[num].lock));
   b->refcnt--;
-  if (b->refcnt == 0) {
-    // no one is waiting for it.
-    b->next->prev = b->prev;
-    b->prev->next = b->next;
-    b->next = bcache.head.next;
-    b->prev = &bcache.head;
-    bcache.head.next->prev = b;
-    bcache.head.next = b;
-  }
-  
-  release(&bcache.lock);
+  release(&(hashTable[num].lock));
 }
 
 void
 bpin(struct buf *b) {
-  acquire(&bcache.lock);
+  uint64 num = b->blockno % NBUC;
+  acquire(&(hashTable[num].lock));
   b->refcnt++;
-  release(&bcache.lock);
+  release(&(hashTable[num].lock));
 }
 
 void
 bunpin(struct buf *b) {
-  acquire(&bcache.lock);
+  uint64 num = b->blockno % NBUC;
+  acquire(&(hashTable[num].lock));
   b->refcnt--;
-  release(&bcache.lock);
+  release(&(hashTable[num].lock));
 }
 
 
