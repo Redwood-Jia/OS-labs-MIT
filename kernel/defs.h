@@ -8,6 +8,7 @@ struct spinlock;
 struct sleeplock;
 struct stat;
 struct superblock;
+struct vm_area_struct;
 
 // bio.c
 void            binit(void);
@@ -86,6 +87,8 @@ int             cpuid(void);
 void            exit(int);
 int             fork(void);
 int             growproc(int);
+//new
+int             lazy_grow_proc(int);
 void            proc_mapstacks(pagetable_t);
 pagetable_t     proc_pagetable(struct proc *);
 void            proc_freepagetable(pagetable_t, uint64);
@@ -181,6 +184,11 @@ void            plic_complete(int);
 void            virtio_disk_init(void);
 void            virtio_disk_rw(struct buf *, int);
 void            virtio_disk_intr(void);
+
+//vma.c
+void        vma_init(void);
+struct vm_area_struct*      vma_alloc(void);
+void        vma_free(struct vm_area_struct *vmap);
 
 // number of elements in fixed-size array
 #define NELEM(x) (sizeof(x)/sizeof((x)[0]))
